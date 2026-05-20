@@ -25,15 +25,22 @@ import argparse
 import einops
 import imageio
 import json
+import mimetypes
 import numpy as np
+import queue
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 from scipy.spatial.transform import Rotation as R
 from PIL import Image, ImageDraw, ImageFont
 from moviepy.editor import VideoFileClip, VideoClip
 
 from hyvideo.pipelines.worldplay_video_pipeline import HunyuanVideo_1_5_Pipeline
-from hyvideo.commons.parallel_states import initialize_parallel_state
+from hyvideo.commons import auto_offload_model
+from hyvideo.commons.parallel_states import initialize_parallel_state, get_parallel_state
 from hyvideo.commons.infer_state import initialize_infer_state
-from hyvideo.generate_custom_trajectory import generate_camera_trajectory_local
+from hyvideo.generate_custom_trajectory import generate_camera_trajectory_local, CameraState
 
 parallel_dims = initialize_parallel_state(sp=int(os.environ.get("WORLD_SIZE", "1")))
 torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
@@ -156,7 +163,6 @@ def pose_string_to_json(pose_string):
     motions = parse_pose_string(pose_string)
     poses = generate_camera_trajectory_local(motions)
 
-    # Default intrinsic matrix (from generate_custom_trajectory.py)
     intrinsic = [
         [969.6969696969696, 0.0, 960.0],
         [0.0, 969.6969696969696, 540.0],
@@ -168,6 +174,108 @@ def pose_string_to_json(pose_string):
         pose_json[str(i)] = {"extrinsic": p.tolist(), "K": intrinsic}
 
     return pose_json
+
+
+def incremental_poses_to_input(incremental_poses, prev_c2w=None, intrinsic=None):
+    """
+    Convert incremental poses to input tensors for interactive mode.
+
+    Args:
+        incremental_poses: list of 4x4 c2w matrices (np.ndarray)
+        prev_c2w: 4x4 c2w matrix from previous round's last frame (np.ndarray)
+                  If None, uses first frame of incremental_poses as reference
+        intrinsic: 3x3 intrinsic matrix (np.ndarray)
+                   If None, uses default intrinsic
+
+    Returns:
+        tuple: (w2c_list, intrinsic_list, action_one_label)
+    """
+    if intrinsic is None:
+        intrinsic = np.array([
+            [969.6969696969696, 0.0, 960.0],
+            [0.0, 969.6969696969696, 540.0],
+            [0.0, 0.0, 1.0],
+        ])
+
+    latent_num = len(incremental_poses)
+
+    intrinsic_list = []
+    w2c_list = []
+    for i in range(latent_num):
+        c2w = incremental_poses[i]
+        w2c = np.linalg.inv(c2w)
+        w2c_list.append(w2c)
+
+        intrinsic_copy = intrinsic.copy()
+        intrinsic_copy[0, 0] /= intrinsic_copy[0, 2] * 2
+        intrinsic_copy[1, 1] /= intrinsic_copy[1, 2] * 2
+        intrinsic_copy[0, 2] = 0.5
+        intrinsic_copy[1, 2] = 0.5
+        intrinsic_list.append(intrinsic_copy)
+
+    w2c_list = np.array(w2c_list)
+    intrinsic_list = torch.tensor(np.array(intrinsic_list))
+
+    c2ws = np.linalg.inv(w2c_list)
+
+    relative_c2w = np.zeros_like(c2ws)
+    if prev_c2w is None:
+        relative_c2w[0, ...] = c2ws[0, ...]
+        C_inv = np.linalg.inv(c2ws[:-1])
+        relative_c2w[1:, ...] = C_inv @ c2ws[1:, ...]
+    else:
+        prev_w2c = np.linalg.inv(prev_c2w)
+        relative_c2w[0, ...] = prev_w2c @ c2ws[0]
+        C_inv = np.linalg.inv(c2ws[:-1])
+        relative_c2w[1:, ...] = C_inv @ c2ws[1:, ...]
+
+    trans_one_hot = np.zeros((relative_c2w.shape[0], 4), dtype=np.int32)
+    rotate_one_hot = np.zeros((relative_c2w.shape[0], 4), dtype=np.int32)
+
+    move_norm_valid = 0.0001
+    for i in range(1, relative_c2w.shape[0]):
+        move_dirs = relative_c2w[i, :3, 3]
+        move_norms = np.linalg.norm(move_dirs)
+        if move_norms > move_norm_valid:
+            move_norm_dirs = move_dirs / move_norms
+            angles_rad = np.arccos(move_norm_dirs.clip(-1.0, 1.0))
+            trans_angles_deg = angles_rad * (180.0 / torch.pi)
+        else:
+            trans_angles_deg = torch.zeros(3)
+
+        R_rel = relative_c2w[i, :3, :3]
+        r = R.from_matrix(R_rel)
+        rot_angles_deg = r.as_euler("xyz", degrees=True)
+
+        if move_norms > move_norm_valid:
+            if trans_angles_deg[2] < 60:
+                trans_one_hot[i, 0] = 1
+            elif trans_angles_deg[2] > 120:
+                trans_one_hot[i, 1] = 1
+
+            if trans_angles_deg[0] < 60:
+                trans_one_hot[i, 2] = 1
+            elif trans_angles_deg[0] > 120:
+                trans_one_hot[i, 3] = 1
+
+        if rot_angles_deg[1] > 5e-2:
+            rotate_one_hot[i, 0] = 1
+        elif rot_angles_deg[1] < -5e-2:
+            rotate_one_hot[i, 1] = 1
+
+        if rot_angles_deg[0] > 5e-2:
+            rotate_one_hot[i, 2] = 1
+        elif rot_angles_deg[0] < -5e-2:
+            rotate_one_hot[i, 3] = 1
+
+    trans_one_hot = torch.tensor(trans_one_hot)
+    rotate_one_hot = torch.tensor(rotate_one_hot)
+
+    trans_one_label = one_hot_to_one_dimension(trans_one_hot)
+    rotate_one_label = one_hot_to_one_dimension(rotate_one_hot)
+    action_one_label = trans_one_label * 9 + rotate_one_label
+
+    return torch.as_tensor(w2c_list), torch.as_tensor(intrinsic_list), action_one_label
 
 
 def pose_to_input(pose_data, latent_num, tps=False):
@@ -290,6 +398,521 @@ def save_video(video, path):
     vid = (video * 255).clamp(0, 255).to(torch.uint8)
     vid = einops.rearrange(vid, "c f h w -> f h w c")
     imageio.mimwrite(path, vid, fps=24)
+
+
+def decode_latents_to_video(pipe, latents):
+    latents = latents.to(device=pipe.execution_device, dtype=pipe.target_dtype)
+    if hasattr(pipe.vae.config, "shift_factor") and pipe.vae.config.shift_factor:
+        latents = latents / pipe.vae.config.scaling_factor + pipe.vae.config.shift_factor
+    else:
+        latents = latents / pipe.vae.config.scaling_factor
+
+    with (
+        torch.no_grad(),
+        torch.autocast(
+            device_type="cuda",
+            dtype=pipe.vae_dtype,
+            enabled=pipe.vae_autocast_enabled,
+        ),
+        auto_offload_model(pipe.vae, pipe.execution_device, enabled=pipe.enable_offloading),
+    ):
+        video = pipe.vae.decode(latents, return_dict=False)[0]
+    return (video / 2 + 0.5).clamp(0, 1).cpu().float()
+
+
+def save_interactive_video(pipe, history_latents, accumulated_frames, path):
+    if history_latents is not None:
+        try:
+            save_video(decode_latents_to_video(pipe, history_latents), path)
+            return
+        except Exception as exc:
+            print(f"Failed to decode accumulated latents, falling back to chunk frames: {exc}")
+    combined = torch.cat(accumulated_frames, dim=2)
+    save_video(combined, path)
+
+
+def save_action_prompt_memory(memory, path, base_prompt):
+    payload = {
+        "base_prompt": base_prompt,
+        "entries": memory,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+WEB_INDEX_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HY-WorldPlay Interactive</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101216;
+      --panel: #191d24;
+      --panel-2: #202631;
+      --line: #343c49;
+      --text: #f4f7fb;
+      --muted: #aeb8c7;
+      --accent: #2fb7a6;
+      --accent-2: #f2b84b;
+      --danger: #ef6262;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 18px;
+      min-height: 100vh;
+      padding: 18px;
+    }
+    aside, section {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      min-width: 0;
+    }
+    aside {
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    .status {
+      display: grid;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+    .status strong { color: var(--text); }
+    .prompt-box {
+      display: grid;
+      gap: 8px;
+    }
+    .prompt-box label {
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    textarea {
+      width: 100%;
+      min-height: 120px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #11151b;
+      color: var(--text);
+      padding: 10px;
+      font: inherit;
+      line-height: 1.35;
+    }
+    textarea:focus {
+      outline: 1px solid var(--accent);
+      border-color: var(--accent);
+    }
+    .kbd {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(58px, 1fr));
+      gap: 8px;
+      max-width: 260px;
+    }
+    .spacer { visibility: hidden; }
+    button {
+      min-height: 52px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel-2);
+      color: var(--text);
+      font-size: 16px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button:hover { border-color: var(--accent); }
+    button:active, button.active { background: var(--accent); color: #06110f; }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .actions {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    .actions button { min-height: 42px; font-size: 14px; }
+    .actions .stop { border-color: color-mix(in srgb, var(--danger), var(--line)); }
+    .player {
+      display: grid;
+      grid-template-rows: minmax(260px, 1fr) auto;
+      overflow: hidden;
+    }
+    .stage {
+      display: grid;
+      place-items: center;
+      padding: 16px;
+      background: #080a0d;
+      min-height: 0;
+    }
+    video {
+      width: min(100%, 1120px);
+      max-height: calc(100vh - 170px);
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 6px;
+    }
+    .timeline {
+      border-top: 1px solid var(--line);
+      padding: 12px 14px;
+      display: flex;
+      gap: 8px;
+      overflow-x: auto;
+      min-height: 68px;
+    }
+    .chip {
+      white-space: nowrap;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 8px 12px;
+      color: var(--muted);
+      background: var(--panel-2);
+      font-size: 13px;
+    }
+    .chip.current { color: #101216; background: var(--accent-2); border-color: var(--accent-2); }
+    @media (max-width: 820px) {
+      main { grid-template-columns: 1fr; }
+      video { max-height: 52vh; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <aside>
+      <h1>HY-WorldPlay</h1>
+      <div class="status">
+        <div>Status: <strong id="state">loading</strong></div>
+        <div>Last: <strong id="last">none</strong></div>
+        <div>Total frames: <strong id="frames">0</strong></div>
+      </div>
+      <div class="prompt-box">
+        <label for="prompt">Prompt for next chunk</label>
+        <textarea id="prompt"></textarea>
+      </div>
+      <div class="kbd" aria-label="Movement controls">
+        <div class="spacer"></div>
+        <button data-action="w">W</button>
+        <div class="spacer"></div>
+        <button data-action="a">A</button>
+        <button data-action="s">S</button>
+        <button data-action="d">D</button>
+        <div class="spacer"></div>
+        <button data-action="up">↑</button>
+        <div class="spacer"></div>
+        <button data-action="left">←</button>
+        <button data-action="down">↓</button>
+        <button data-action="right">→</button>
+      </div>
+      <div class="actions">
+        <button id="save">Save</button>
+        <button id="quit" class="stop">Quit</button>
+      </div>
+    </aside>
+    <section class="player">
+      <div class="stage">
+        <video id="video" controls autoplay muted playsinline></video>
+      </div>
+      <div id="timeline" class="timeline"></div>
+    </section>
+  </main>
+  <script>
+    const keyMap = {
+      KeyW: "w", KeyA: "a", KeyS: "s", KeyD: "d",
+      ArrowUp: "up", ArrowDown: "down", ArrowLeft: "left", ArrowRight: "right"
+    };
+    const stateEl = document.getElementById("state");
+    const lastEl = document.getElementById("last");
+    const framesEl = document.getElementById("frames");
+    const video = document.getElementById("video");
+    const timeline = document.getElementById("timeline");
+    const promptInput = document.getElementById("prompt");
+    const buttons = [...document.querySelectorAll("button[data-action]")];
+    let chunks = [];
+    let playingIndex = -1;
+    let promptInitialized = false;
+
+    async function post(path, body = {}) {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body)
+      });
+      if (!res.ok) throw new Error(await res.text());
+      return await res.json();
+    }
+
+    async function sendAction(action) {
+      if (buttons.some(btn => btn.disabled)) return;
+      setButtons(true);
+      try {
+        await post("/api/action", {action, prompt: promptInput.value});
+        await refresh();
+      } catch (err) {
+        stateEl.textContent = err.message;
+        setButtons(false);
+      }
+    }
+
+    function setButtons(disabled) {
+      buttons.forEach(btn => btn.disabled = disabled);
+    }
+
+    function renderTimeline() {
+      timeline.innerHTML = "";
+      chunks.forEach((chunk, index) => {
+        const el = document.createElement("button");
+        el.className = "chip" + (index === playingIndex ? " current" : "");
+        const prompt = chunk.prompt ? ` · ${chunk.prompt.slice(0, 28)}` : "";
+        el.textContent = `${chunk.round}: ${chunk.command}${prompt}`;
+        el.onclick = () => playChunk(index);
+        timeline.appendChild(el);
+      });
+    }
+
+    function playChunk(index) {
+      if (!chunks[index]) return;
+      playingIndex = index;
+      video.src = chunks[index].url + "?t=" + Date.now();
+      video.play().catch(() => {});
+      renderTimeline();
+    }
+
+    video.addEventListener("ended", () => {
+      if (playingIndex + 1 < chunks.length) playChunk(playingIndex + 1);
+    });
+
+    async function refresh() {
+      const status = await fetch("/api/status").then(r => r.json());
+      if (!promptInitialized) {
+        promptInput.value = status.base_prompt || "";
+        promptInitialized = true;
+      }
+      stateEl.textContent = status.busy ? "rendering" : status.message;
+      lastEl.textContent = status.last_command || "none";
+      framesEl.textContent = status.total_frames;
+      setButtons(status.busy || status.queue_size > 0);
+      if (status.chunks.length !== chunks.length) {
+        chunks = status.chunks;
+        if (playingIndex === -1 || playingIndex < chunks.length - 1) {
+          playChunk(chunks.length - 1);
+        } else {
+          renderTimeline();
+        }
+      } else {
+        renderTimeline();
+      }
+    }
+
+    document.addEventListener("keydown", event => {
+      if (event.target === promptInput) return;
+      if (event.repeat) return;
+      const action = keyMap[event.code];
+      if (!action) return;
+      event.preventDefault();
+      document.querySelector(`[data-action="${action}"]`)?.classList.add("active");
+      sendAction(action);
+    });
+    document.addEventListener("keyup", event => {
+      const action = keyMap[event.code];
+      if (action) document.querySelector(`[data-action="${action}"]`)?.classList.remove("active");
+    });
+    buttons.forEach(btn => btn.addEventListener("click", () => sendAction(btn.dataset.action)));
+    document.getElementById("save").onclick = () => post("/api/save").then(refresh);
+    document.getElementById("quit").onclick = () => post("/api/quit").then(refresh);
+    setInterval(refresh, 1500);
+    refresh();
+  </script>
+</body>
+</html>
+"""
+
+
+def start_web_controller(args, output_path, latent_num):
+    command_queue = queue.Queue()
+    chunks_dir = os.path.join(output_path, "web_chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+    state = {
+        "busy": False,
+        "message": "ready",
+        "last_command": None,
+        "last_prompt": None,
+        "total_frames": 0,
+        "chunks": [],
+        "base_prompt": args.prompt,
+    }
+    lock = threading.Lock()
+    action_aliases = {
+        "w": "w",
+        "a": "a",
+        "s": "s",
+        "d": "d",
+        "up": "up",
+        "down": "down",
+        "left": "left",
+        "right": "right",
+    }
+
+    def json_response(handler, payload, status=200):
+        data = json.dumps(payload).encode("utf-8")
+        handler.send_response(status)
+        handler.send_header("Content-Type", "application/json")
+        handler.send_header("Content-Length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+
+    def read_json(handler):
+        content_length = int(handler.headers.get("Content-Length", "0"))
+        if content_length <= 0:
+            return {}
+        raw = handler.rfile.read(content_length)
+        return json.loads(raw.decode("utf-8"))
+
+    def make_status():
+        with lock:
+            return {
+                **state,
+                "queue_size": command_queue.qsize(),
+                "chunk_latents": latent_num,
+            }
+
+    class WebHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def do_GET(self):
+            parsed = urlparse(self.path)
+            if parsed.path == "/":
+                data = WEB_INDEX_HTML.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            if parsed.path == "/api/status":
+                json_response(self, make_status())
+                return
+            if parsed.path.startswith("/chunks/"):
+                name = os.path.basename(parsed.path)
+                path = os.path.join(chunks_dir, name)
+                if not os.path.isfile(path):
+                    self.send_error(404)
+                    return
+                content_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(os.path.getsize(path)))
+                self.end_headers()
+                with open(path, "rb") as f:
+                    while True:
+                        block = f.read(1024 * 1024)
+                        if not block:
+                            break
+                        self.wfile.write(block)
+                return
+            self.send_error(404)
+
+        def do_POST(self):
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path == "/api/action":
+                    payload = read_json(self)
+                    command = payload.get("command")
+                    action = payload.get("action")
+                    if not command:
+                        action = action_aliases.get(str(action).strip())
+                        if not action:
+                            json_response(self, {"error": "unknown action"}, status=400)
+                            return
+                        command = f"{action}-{latent_num}"
+                    prompt = str(payload.get("prompt") or args.prompt).strip()
+                    command_queue.put(
+                        {"type": "action", "command": command, "prompt": prompt}
+                    )
+                    with lock:
+                        state["message"] = "queued"
+                        state["last_prompt"] = prompt
+                    json_response(self, {"ok": True, "command": command})
+                    return
+                if parsed.path == "/api/save":
+                    command_queue.put({"type": "save", "command": "save"})
+                    with lock:
+                        state["message"] = "save queued"
+                    json_response(self, {"ok": True})
+                    return
+                if parsed.path == "/api/quit":
+                    command_queue.put({"type": "quit", "command": "quit"})
+                    with lock:
+                        state["message"] = "quit queued"
+                    json_response(self, {"ok": True})
+                    return
+            except Exception as exc:
+                json_response(self, {"error": str(exc)}, status=500)
+                return
+            self.send_error(404)
+
+    server = ThreadingHTTPServer((args.web_host, args.web_port), WebHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    print(f"Web UI running at http://{args.web_host}:{args.web_port}")
+
+    def mark_busy(command, prompt=None):
+        with lock:
+            state["busy"] = True
+            state["message"] = "rendering"
+            state["last_command"] = command
+            if prompt is not None:
+                state["last_prompt"] = prompt
+
+    def mark_ready(message="ready"):
+        with lock:
+            state["busy"] = False
+            state["message"] = message
+
+    def add_chunk(round_count, command, prompt, frames):
+        filename = f"chunk_{round_count:04d}.mp4"
+        path = os.path.join(chunks_dir, filename)
+        save_video(frames, path)
+        with lock:
+            state["chunks"].append(
+                {
+                    "round": round_count,
+                    "command": command,
+                    "prompt": prompt,
+                    "url": f"/chunks/{filename}",
+                    "frames": int(frames.shape[2]),
+                    "created_at": time.time(),
+                }
+            )
+            state["total_frames"] += int(frames.shape[2])
+            state["busy"] = False
+            state["message"] = "ready"
+
+    return {
+        "queue": command_queue,
+        "server": server,
+        "mark_busy": mark_busy,
+        "mark_ready": mark_ready,
+        "add_chunk": add_chunk,
+    }
 
 
 def rank0_log(message, level):
@@ -826,6 +1449,329 @@ def generate_video(args):
                 traceback.print_exc()
 
 
+def generate_video_interactive(args):
+    assert args.model_type == "ar", "Interactive mode requires model_type='ar'"
+
+    interactive_video_length = args.interactive_video_length
+    assert (interactive_video_length - 1) % 4 == 0, (
+        f"interactive_video_length must be of form 4*n + 1, got {interactive_video_length}"
+    )
+    latent_num = (interactive_video_length - 1) // 4 + 1
+    assert latent_num % 4 == 0, (
+        "number of latents must be divisible by 4; "
+        f"interactive_video_length={interactive_video_length} gives {latent_num} latents. "
+        "Use values like 13, 29, 45, 61, ..."
+    )
+
+    initialize_infer_state(args)
+
+    task = "i2v" if args.image_path else "t2v"
+
+    enable_sr = False
+
+    transformer_version = f"{args.resolution}_{task}"
+    assert transformer_version == "480p_i2v"
+
+    if args.dtype == "bf16":
+        transformer_dtype = torch.bfloat16
+    elif args.dtype == "fp32":
+        transformer_dtype = torch.float32
+    else:
+        raise ValueError(f"Unsupported dtype: {args.dtype}. Must be 'bf16' or 'fp32'")
+
+    pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
+        pretrained_model_name_or_path=args.model_path,
+        transformer_version=transformer_version,
+        enable_offloading=args.offloading,
+        enable_group_offloading=args.group_offloading,
+        create_sr_pipeline=enable_sr,
+        force_sparse_attn=False,
+        transformer_dtype=transformer_dtype,
+        action_ckpt=args.action_ckpt,
+    )
+
+    extra_kwargs = {}
+    if task == "i2v":
+        extra_kwargs["reference_image"] = args.image_path
+
+    enable_rewrite = args.rewrite
+    if not args.rewrite:
+        rank0_log(
+            "Warning: Prompt rewriting is disabled in interactive mode.",
+            "WARNING",
+        )
+
+    camera_state = CameraState()
+
+    if args.initial_pose:
+        initial_motions = parse_pose_string(args.initial_pose)
+        generate_camera_trajectory_local(initial_motions, camera_state)
+
+    output_path = args.output_path or "./outputs"
+    os.makedirs(output_path, exist_ok=True)
+    accumulated_frames = []
+    history_latents = None
+    history_cond_latents = None
+    history_viewmats = None
+    history_Ks = None
+    history_action = None
+    action_prompt_memory = []
+    round_count = 0
+    is_rank0 = int(os.environ.get("RANK", "0")) == 0
+    web_controller = None
+    if args.web and is_rank0:
+        web_controller = start_web_controller(args, output_path, latent_num)
+
+    try:
+        import cv2
+        has_cv2 = True
+    except ImportError:
+        has_cv2 = False
+        print("Warning: OpenCV not found, display window will be disabled")
+
+    display = None
+    if is_rank0 and args.display_window and not args.web and has_cv2:
+        from hyvideo.display import get_display, close_display
+        display = get_display(create=True)
+
+    print("\n" + "=" * 60)
+    if args.web:
+        print(f"Interactive Web Mode - open http://{args.web_host}:{args.web_port}")
+    else:
+        print("Interactive Mode - Enter pose commands (e.g., 'w-4,d-2')")
+    print("Commands: w(forward), s(backward), a(left), d(right)")
+    print("          up, down (pitch), left, right (yaw)")
+    print("Type 'quit' or 'q' to exit, 'save' to save video")
+    print("=" * 60 + "\n")
+
+    web_idle_poll_seconds = 30
+
+    while True:
+        try:
+            if is_rank0:
+                if args.web:
+                    try:
+                        command_item = web_controller["queue"].get(
+                            timeout=web_idle_poll_seconds
+                        )
+                    except queue.Empty:
+                        command_item = {
+                            "type": "noop",
+                            "command": "",
+                            "prompt": args.prompt,
+                        }
+                else:
+                    print(f"\n--- Round {round_count + 1} ---")
+                    command_item = {
+                        "type": "action",
+                        "command": input("Enter pose command: ").strip(),
+                        "prompt": args.prompt,
+                    }
+            else:
+                command_item = {}
+
+            if torch.distributed.is_initialized():
+                obj_list = [command_item]
+                if get_parallel_state().sp_enabled:
+                    group_src_rank = torch.distributed.get_global_rank(
+                        get_parallel_state().sp_group, 0
+                    )
+                    torch.distributed.broadcast_object_list(
+                        obj_list, src=group_src_rank, group=get_parallel_state().sp_group
+                    )
+                else:
+                    torch.distributed.broadcast_object_list(
+                        obj_list, src=0
+                    )
+                command_item = obj_list[0]
+
+            if isinstance(command_item, str):
+                command_item = {
+                    "type": "action",
+                    "command": command_item,
+                    "prompt": args.prompt,
+                }
+
+            pose_input = str(command_item.get("command", "")).strip()
+            command_type = command_item.get("type", "action")
+            chunk_prompt = str(command_item.get("prompt") or args.prompt).strip()
+            if not chunk_prompt:
+                chunk_prompt = args.prompt
+
+            if command_type == "noop" or not pose_input:
+                continue
+
+            if is_rank0:
+                print(f"\n--- Round {round_count + 1}: {pose_input} ---")
+
+            if command_type == "quit" or pose_input in ["quit", "q", "exit"]:
+                print("Exiting interactive mode...")
+                break
+
+            if command_type == "save" or pose_input in ["save"]:
+                if accumulated_frames and is_rank0:
+                    save_path = os.path.join(output_path, f"interactive_gen_{round_count}.mp4")
+                    save_interactive_video(pipe, history_latents, accumulated_frames, save_path)
+                    memory_path = os.path.join(output_path, f"interactive_memory_{round_count}.json")
+                    save_action_prompt_memory(action_prompt_memory, memory_path, args.prompt)
+                    print(f"Saved video to: {save_path}")
+                    print(f"Saved action/prompt memory to: {memory_path}")
+                    if web_controller is not None:
+                        web_controller["mark_ready"](f"saved {os.path.basename(save_path)}")
+                continue
+
+            if web_controller is not None:
+                web_controller["mark_busy"](pose_input, chunk_prompt)
+
+            motions = parse_pose_string(pose_input)
+
+            prev_c2w = camera_state.last_c2w.copy() if camera_state.last_c2w is not None else None
+
+            next_camera_state = CameraState()
+            next_camera_state.restore(camera_state.save())
+            poses = generate_camera_trajectory_local(motions, next_camera_state)
+
+            if prev_c2w is not None:
+                incremental_poses = poses[1:]
+            else:
+                incremental_poses = poses
+
+            if len(incremental_poses) == 0:
+                print("No new poses to generate")
+                continue
+            if len(incremental_poses) != latent_num:
+                raise ValueError(
+                    f"Interactive command produced {len(incremental_poses)} latent poses, "
+                    f"but interactive_video_length={interactive_video_length} requires {latent_num}. "
+                    f"Use commands whose total duration is {latent_num}, e.g. 'w-{latent_num}'."
+                )
+            camera_state = next_camera_state
+
+            w2c_list, Ks, action = incremental_poses_to_input(
+                incremental_poses, prev_c2w=prev_c2w, intrinsic=np.array(camera_state.intrinsic)
+            )
+
+            out = pipe(
+                enable_sr=False,
+                prompt=chunk_prompt,
+                aspect_ratio=args.aspect_ratio,
+                num_inference_steps=args.num_inference_steps,
+                sr_num_inference_steps=None,
+                video_length=interactive_video_length,
+                negative_prompt=args.negative_prompt,
+                seed=args.seed + round_count if args.seed else None,
+                output_type="pt",
+                prompt_rewrite=False,
+                return_pre_sr_video=False,
+                viewmats=w2c_list.unsqueeze(0),
+                Ks=Ks.unsqueeze(0),
+                action=action.unsqueeze(0),
+                few_step=args.few_step,
+                chunk_latent_frames=latent_num,
+                model_type=args.model_type,
+                user_height=args.height,
+                user_width=args.width,
+                history_latents=history_latents,
+                history_cond_latents=history_cond_latents,
+                history_viewmats=history_viewmats,
+                history_Ks=history_Ks,
+                history_action=history_action,
+                start_latent_idx=history_latents.shape[2] if history_latents is not None else 0,
+                transformer_resident_ar_rollout=args.transformer_resident_ar_rollout,
+                **extra_kwargs,
+            )
+
+            frames = out.videos
+            if history_latents is None:
+                history_latents = out.latents
+                history_cond_latents = out.cond_latents
+                history_viewmats = out.viewmats
+                history_Ks = out.Ks
+                history_action = out.action
+            else:
+                history_latents = torch.cat([history_latents, out.latents], dim=2)
+                history_cond_latents = torch.cat(
+                    [history_cond_latents, out.cond_latents], dim=2
+                )
+                history_viewmats = torch.cat([history_viewmats, out.viewmats], dim=1)
+                history_Ks = torch.cat([history_Ks, out.Ks], dim=1)
+                history_action = torch.cat([history_action, out.action], dim=1)
+
+            actions_dict = {"forward": 0, "left": 0, "yaw": 0, "pitch": 0}
+            for cmd in pose_input.split(","):
+                cmd = cmd.strip()
+                if not cmd:
+                    continue
+                parts = cmd.split("-")
+                if len(parts) == 2:
+                    action_name = parts[0].strip()
+                    duration = int(parts[1].strip())
+                    if action_name == "w":
+                        actions_dict["forward"] = 1
+                    elif action_name == "s":
+                        actions_dict["forward"] = -1
+                    elif action_name == "a":
+                        actions_dict["left"] = 1
+                    elif action_name == "d":
+                        actions_dict["left"] = -1
+                    elif action_name == "left":
+                        actions_dict["yaw"] = -1
+                    elif action_name == "right":
+                        actions_dict["yaw"] = 1
+                    elif action_name == "up":
+                        actions_dict["pitch"] = 1
+                    elif action_name == "down":
+                        actions_dict["pitch"] = -1
+
+            accumulated_frames.append(frames)
+            if web_controller is not None and is_rank0:
+                web_controller["add_chunk"](round_count + 1, pose_input, chunk_prompt, frames)
+
+            if display is not None:
+                for i in range(frames.shape[2]):
+                    frame = frames[0, :, i]
+                    display.display_frame(frame.unsqueeze(0), actions_dict)
+
+            round_count += 1
+            action_prompt_memory.append(
+                {
+                    "round": round_count,
+                    "command": pose_input,
+                    "prompt": chunk_prompt,
+                    "frames": int(frames.shape[2]),
+                    "latent_frames": int(out.latents.shape[2]) if out.latents is not None else None,
+                    "seed": args.seed + (round_count - 1) if args.seed else None,
+                }
+            )
+
+            print(f"Generated {frames.shape[2]} frames. Total frames: {sum(f.shape[2] for f in accumulated_frames)}")
+
+        except KeyboardInterrupt:
+            print("\nInterrupted by user")
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            if web_controller is not None:
+                web_controller["mark_ready"](f"error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    if display is not None:
+        close_display()
+
+    if accumulated_frames and is_rank0:
+        output_path = args.output_path or "./outputs"
+        os.makedirs(output_path, exist_ok=True)
+        save_path = os.path.join(output_path, "interactive_final.mp4")
+        save_interactive_video(pipe, history_latents, accumulated_frames, save_path)
+        memory_path = os.path.join(output_path, "interactive_memory_final.json")
+        save_action_prompt_memory(action_prompt_memory, memory_path, args.prompt)
+        print(f"Saved final video to: {save_path}")
+        print(f"Saved action/prompt memory to: {memory_path}")
+    if web_controller is not None:
+        web_controller["server"].shutdown()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Generate video using HunyuanWorld-1.5"
@@ -1053,12 +1999,67 @@ def main():
         "Reduces inference time without increasing peak VRAM. Only affects AR model_type with offloading enabled. "
         "Use --transformer_resident_ar_rollout or --transformer_resident_ar_rollout true to enable.",
     )
+    parser.add_argument(
+        "--interactive",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable interactive mode for real-time video generation (default: false). "
+        "Use --interactive or --interactive true to enable.",
+    )
+    parser.add_argument(
+        "--interactive_video_length",
+        type=int,
+        default=13,
+        help="Number of frames to generate per interaction round (default: 13, which is 4 latents). "
+        "Must produce a latent count divisible by 4: latents=(frames - 1)//4 + 1, "
+        "so valid values include 13, 29, 45, 61, 77, ...",
+    )
+    parser.add_argument(
+        "--initial_pose",
+        type=str,
+        default=None,
+        help="Initial pose string for interactive mode (e.g., 'w-4'). "
+        "If not provided, camera starts at origin.",
+    )
+    parser.add_argument(
+        "--display_window",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable real-time video display window in interactive mode (default: true).",
+    )
+    parser.add_argument(
+        "--web",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable browser-based interactive control for interactive mode (default: false).",
+    )
+    parser.add_argument(
+        "--web_host",
+        type=str,
+        default="0.0.0.0",
+        help="Host for the interactive web UI (default: 0.0.0.0).",
+    )
+    parser.add_argument(
+        "--web_port",
+        type=int,
+        default=7860,
+        help="Port for the interactive web UI (default: 7860).",
+    )
 
     args = parser.parse_args()
 
     assert args.image_path is not None
 
-    generate_video(args)
+    if args.interactive:
+        generate_video_interactive(args)
+    else:
+        generate_video(args)
 
 
 if __name__ == "__main__":

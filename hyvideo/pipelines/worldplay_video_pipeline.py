@@ -94,6 +94,11 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 class HunyuanVideoPipelineOutput(BaseOutput):
     videos: Union[torch.Tensor, np.ndarray]
     sr_videos: Optional[Union[torch.Tensor, np.ndarray]] = None
+    latents: Optional[torch.Tensor] = None
+    cond_latents: Optional[torch.Tensor] = None
+    viewmats: Optional[torch.Tensor] = None
+    Ks: Optional[torch.Tensor] = None
+    action: Optional[torch.Tensor] = None
 
 
 class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
@@ -1013,6 +1018,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         action,
         device,
         transformer_resident=False,
+        history_latents=None,
+        history_cond_latents=None,
+        history_viewmats=None,
+        history_Ks=None,
+        history_action=None,
+        start_latent_idx=0,
     ):
         # When transformer_resident is True, keep the transformer on GPU for the
         # entire AR rollout instead of loading/offloading it per chunk.  This does
@@ -1029,6 +1040,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                         latents, timesteps, prompt_embeds, prompt_mask,
                         vision_states, cond_latents, task_type, extra_kwargs,
                         viewmats, Ks, action, device,
+                        history_latents=history_latents,
+                        history_cond_latents=history_cond_latents,
+                        history_viewmats=history_viewmats,
+                        history_Ks=history_Ks,
+                        history_action=history_action,
+                        start_latent_idx=start_latent_idx,
                     )
                 finally:
                     self.enable_offloading = orig
@@ -1037,6 +1054,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 latents, timesteps, prompt_embeds, prompt_mask,
                 vision_states, cond_latents, task_type, extra_kwargs,
                 viewmats, Ks, action, device,
+                history_latents=history_latents,
+                history_cond_latents=history_cond_latents,
+                history_viewmats=history_viewmats,
+                history_Ks=history_Ks,
+                history_action=history_action,
+                start_latent_idx=start_latent_idx,
             )
 
     def _ar_rollout_inner(
@@ -1053,6 +1076,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         Ks,
         action,
         device,
+        history_latents=None,
+        history_cond_latents=None,
+        history_viewmats=None,
+        history_Ks=None,
+        history_action=None,
+        start_latent_idx=0,
     ):
         self.init_kv_cache()
         positive_idx = 1 if self.do_classifier_free_guidance else 0
@@ -1110,21 +1139,38 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     cache_txt=True,
                 )
 
-        selected_frame_indices = []
+        history_latent_frames = (
+            history_latents.shape[2] if history_latents is not None else 0
+        )
+        has_history = history_latent_frames > 0
+        if has_history:
+            history_latents = history_latents.to(device=device, dtype=latents.dtype)
+            history_cond_latents = history_cond_latents.to(
+                device=device, dtype=cond_latents.dtype
+            )
+            history_viewmats = history_viewmats.to(device=device)
+            history_Ks = history_Ks.to(device=device)
+            history_action = history_action.to(device=device)
+            combined_viewmats = torch.cat([history_viewmats, viewmats.to(device)], dim=1)
+        else:
+            combined_viewmats = viewmats.to(device)
 
         for chunk_i in range(self.chunk_num):
-            if chunk_i > 0:
-                current_frame_idx = (
-                    chunk_i * self.chunk_latent_frames
-                )  # the current frame index to generate
+            current_frame_idx = (
+                chunk_i * self.chunk_latent_frames
+            )  # the current frame index to generate
+            global_frame_idx = start_latent_idx + current_frame_idx
+            selected_context_count = 0
+
+            if chunk_i > 0 or has_history:
 
                 selected_frame_indices = []
                 for chunk_start_idx in range(
                     current_frame_idx, current_frame_idx + self.chunk_latent_frames, 4
                 ):
                     selected_history_frame_id = select_aligned_memory_frames(
-                        viewmats[0].cpu().detach().numpy(),
-                        chunk_start_idx,
+                        combined_viewmats[0].cpu().detach().numpy(),
+                        start_latent_idx + chunk_start_idx,
                         memory_frames=20,
                         temporal_context_size=12,
                         pred_latent_size=4,
@@ -1133,27 +1179,57 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     )
                     selected_frame_indices += selected_history_frame_id
                 selected_frame_indices = sorted(list(set(selected_frame_indices)))
+                selected_frame_indices = [
+                    x for x in selected_frame_indices if x < global_frame_idx
+                ]
                 to_remove = list(
                     range(
-                        current_frame_idx, current_frame_idx + self.chunk_latent_frames
+                        global_frame_idx,
+                        global_frame_idx + self.chunk_latent_frames,
                     )
                 )
                 selected_frame_indices = [
                     x for x in selected_frame_indices if x not in to_remove
                 ]
 
-                context_latents = latents[:, :, selected_frame_indices]
-                context_cond_latents_input = cond_latents[:, :, selected_frame_indices]
+                history_indices = [x for x in selected_frame_indices if x < start_latent_idx]
+                local_indices = [
+                    x - start_latent_idx
+                    for x in selected_frame_indices
+                    if start_latent_idx <= x < global_frame_idx
+                ]
+
+                context_parts = []
+                context_cond_parts = []
+                context_viewmat_parts = []
+                context_K_parts = []
+                context_action_parts = []
+                if history_indices:
+                    context_parts.append(history_latents[:, :, history_indices])
+                    context_cond_parts.append(history_cond_latents[:, :, history_indices])
+                    context_viewmat_parts.append(history_viewmats[:, history_indices])
+                    context_K_parts.append(history_Ks[:, history_indices])
+                    context_action_parts.append(history_action[:, history_indices])
+                if local_indices:
+                    context_parts.append(latents[:, :, local_indices])
+                    context_cond_parts.append(cond_latents[:, :, local_indices])
+                    context_viewmat_parts.append(viewmats[:, local_indices].to(device))
+                    context_K_parts.append(Ks[:, local_indices].to(device))
+                    context_action_parts.append(action[:, local_indices].to(device))
+
+                selected_context_count = sum(part.shape[2] for part in context_parts)
+                context_latents = torch.cat(context_parts, dim=2)
+                context_cond_latents_input = torch.cat(context_cond_parts, dim=2)
                 context_latents_input = torch.concat(
                     [context_latents, context_cond_latents_input], dim=1
                 )
 
-                context_viewmats = viewmats[:, selected_frame_indices].to(device)
-                context_Ks = Ks[:, selected_frame_indices].to(device)
-                context_action = action[:, selected_frame_indices].to(device)
+                context_viewmats = torch.cat(context_viewmat_parts, dim=1).to(device)
+                context_Ks = torch.cat(context_K_parts, dim=1).to(device)
+                context_action = torch.cat(context_action_parts, dim=1).to(device)
 
                 context_timestep = torch.full(
-                    (len(selected_frame_indices),),
+                    (selected_context_count,),
                     stabilization_level - 1,
                     device=device,
                     dtype=timesteps.dtype,
@@ -1259,8 +1335,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                             kv_cache=self._kv_cache,
                             cache_vision=False,
                             rope_temporal_size=latents_concat.shape[2]
-                            + len(selected_frame_indices),
-                            start_rope_start_idx=len(selected_frame_indices),
+                            + selected_context_count,
+                            start_rope_start_idx=selected_context_count,
                         )[0]
                         if self.do_classifier_free_guidance:
                             noise_pred_uncond = self.transformer(
@@ -1278,8 +1354,8 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                                 kv_cache=self._kv_cache_neg,
                                 cache_vision=False,
                                 rope_temporal_size=latents_concat.shape[2]
-                                + len(selected_frame_indices),
-                                start_rope_start_idx=len(selected_frame_indices),
+                                + selected_context_count,
+                                start_rope_start_idx=selected_context_count,
                             )[0]
 
                     if self.do_classifier_free_guidance:
@@ -1517,6 +1593,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         model_type: str = "ar",
         user_height: Optional[int] = None,
         user_width: Optional[int] = None,
+        history_latents: Optional[torch.Tensor] = None,
+        history_cond_latents: Optional[torch.Tensor] = None,
+        history_viewmats: Optional[torch.Tensor] = None,
+        history_Ks: Optional[torch.Tensor] = None,
+        history_action: Optional[torch.Tensor] = None,
+        start_latent_idx: int = 0,
         **kwargs,
     ):
         r"""
@@ -1833,6 +1915,11 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         cond_latents = self._prepare_cond_latents(
             task_type, image_cond, latents, multitask_mask
         )
+        if model_type == "ar" and start_latent_idx > 0:
+            # In non-interactive AR, only the global first latent carries the i2v
+            # reference image condition. Interactive continuation calls the
+            # pipeline once per chunk, so local latent 0 is not global latent 0.
+            cond_latents.zero_()
         with auto_offload_model(
             self.vision_encoder, self.execution_device, enabled=self.enable_offloading
         ):
@@ -1866,6 +1953,12 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 action=action,
                 device=device,
                 transformer_resident=kwargs.get("transformer_resident_ar_rollout", False),
+                history_latents=history_latents,
+                history_cond_latents=history_cond_latents,
+                history_viewmats=history_viewmats,
+                history_Ks=history_Ks,
+                history_action=history_action,
+                start_latent_idx=start_latent_idx,
             )
         elif model_type == "bi":
             latents = self.bi_rollout(
@@ -1882,6 +1975,9 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 action=action,
                 device=device,
             )
+
+        generated_latents = latents.detach().clone()
+        generated_cond_latents = cond_latents.detach().clone()
 
         if enable_sr:
             assert hasattr(self, "sr_pipeline")
@@ -1956,10 +2052,23 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
 
         if enable_sr:
             return HunyuanVideoPipelineOutput(
-                videos=video_frames, sr_videos=sr_video_frames
+                videos=video_frames,
+                sr_videos=sr_video_frames,
+                latents=generated_latents.detach().cpu(),
+                cond_latents=generated_cond_latents.detach().cpu(),
+                viewmats=viewmats.detach().cpu() if viewmats is not None else None,
+                Ks=Ks.detach().cpu() if Ks is not None else None,
+                action=action.detach().cpu() if action is not None else None,
             )
         else:
-            return HunyuanVideoPipelineOutput(videos=video_frames)
+            return HunyuanVideoPipelineOutput(
+                videos=video_frames,
+                latents=generated_latents.detach().cpu(),
+                cond_latents=generated_cond_latents.detach().cpu(),
+                viewmats=viewmats.detach().cpu() if viewmats is not None else None,
+                Ks=Ks.detach().cpu() if Ks is not None else None,
+                action=action.detach().cpu() if action is not None else None,
+            )
 
     @property
     def ideal_resolution(self):

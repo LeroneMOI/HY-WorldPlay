@@ -17,7 +17,38 @@ def rot_z(theta):
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
 
-def generate_camera_trajectory_local(motions):
+class CameraState:
+    def __init__(self):
+        self.T = np.eye(4)
+        self.intrinsic = [
+            [969.6969696969696, 0.0, 960.0],
+            [0.0, 969.6969696969696, 540.0],
+            [0.0, 0.0, 1.0],
+        ]
+        self.last_c2w = None
+
+    def reset(self):
+        self.T = np.eye(4)
+        self.last_c2w = None
+
+    def save(self):
+        state = {
+            "T": self.T.tolist(),
+            "intrinsic": self.intrinsic,
+            "last_c2w": self.last_c2w.tolist() if self.last_c2w is not None else None,
+        }
+        return state
+
+    def restore(self, state):
+        self.T = np.array(state["T"])
+        self.intrinsic = state["intrinsic"]
+        self.last_c2w = np.array(state["last_c2w"]) if state["last_c2w"] is not None else None
+
+
+_global_camera_state = CameraState()
+
+
+def generate_camera_trajectory_local(motions, camera_state=None):
     """
     motions: list of dict
              {"forward": 1.0}, {"yaw": np.pi/2}, {"pitch": np.pi/6}, {"right": 1.0}
@@ -26,44 +57,42 @@ def generate_camera_trajectory_local(motions):
              - pitch: Rotate (Up or Down)
              - right: Translation (Right or Left)
              - third_yaw: Third Perspective Rotate (Left or Right)
-    """
 
-    poses = []
-    T = np.eye(4)
-    poses.append(T.copy())
+    camera_state: CameraState instance for persistent camera transform across rounds.
+                  If None, uses global camera state.
+    """
+    if camera_state is None:
+        camera_state = _global_camera_state
+
+    T = camera_state.T.copy()
+    poses = [T.copy()]
 
     for move in motions:
-        # Rotate (Left or Right)
         if "yaw" in move:
             R = rot_y(move["yaw"])
             T[:3, :3] = T[:3, :3] @ R
 
-        # Rotate (Up or Down)
         if "pitch" in move:
             R = rot_x(move["pitch"])
             T[:3, :3] = T[:3, :3] @ R
 
-        # Translation (Z-direction of the camera's local coordinate system)
         forward = move.get("forward", 0.0)
         if forward != 0:
             local_t = np.array([0, 0, forward])
             world_t = T[:3, :3] @ local_t
             T[:3, 3] += world_t
 
-        # Translation (Z-direction of the camera's local coordinate system)
         right = move.get("right", 0.0)
         if right != 0:
             local_t = np.array([right, 0, 0])
             world_t = T[:3, :3] @ local_t
             T[:3, 3] += world_t
 
-        # Third Perspective Rotate (Left or Right)
         third_yaw = move.get("third_yaw", 0.0)
         if third_yaw != 0:
             theta = -third_yaw
             C = np.array([[1, 0.0, 0, 0], [0, 1, 0, 0], [0, 0, 1, -1.0], [0, 0, 0, 1]])
             c_origin = C.copy()
-            # Rotation around the Y-axis
             R_y = np.array(
                 [
                     [np.cos(theta), 0, np.sin(theta)],
@@ -71,7 +100,6 @@ def generate_camera_trajectory_local(motions):
                     [-np.sin(theta), 0, np.cos(theta)],
                 ]
             )
-            # Translation
             C[:3, :3] = C[:3, :3] @ R_y
             C[:3, 3] = R_y @ C[:3, 3]
             c_inv = np.linalg.inv(c_origin)
@@ -80,23 +108,25 @@ def generate_camera_trajectory_local(motions):
 
         poses.append(T.copy())
 
+    camera_state.T = T
+    camera_state.last_c2w = T.copy()
+
     return poses
 
 
 if __name__ == "__main__":
-    # Examples: Forward 0.08 * 16 -> Right Rotate 3 degree * 16
+    intrinsic = [
+        [969.6969696969696, 0.0, 960.0],
+        [0.0, 969.6969696969696, 540.0],
+        [0.0, 0.0, 1.0],
+    ]
+
     motions = []
     for i in range(15):
         motions.append({"forward": 0.08})
 
     for i in range(16):
         motions.append({"yaw": np.deg2rad(3)})
-
-    intrinsic = [
-        [969.6969696969696, 0.0, 960.0],
-        [0.0, 969.6969696969696, 540.0],
-        [0.0, 0.0, 1.0],
-    ]
 
     poses = generate_camera_trajectory_local(motions)
     custom_c2w = {}

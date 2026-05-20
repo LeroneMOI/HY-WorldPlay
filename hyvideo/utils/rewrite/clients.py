@@ -178,25 +178,31 @@ class QwenVLClient(object):
             raise e
 
         try:
-            with Image.open(image_path) as img:
-                # Resize if image exceeds max dimension while preserving ratio
-                if img.width > max_dimension or img.height > max_dimension:
-                    img.thumbnail((max_dimension, max_dimension))
+            # 判断输入类型
+            if isinstance(image_path, str):
+                img = Image.open(image_path)
+            elif isinstance(image_path, Image.Image):
+                img = image_path
+            else:
+                raise ValueError(f"Expected str or PIL Image, got {type(image_path)}")
+            # Resize if image exceeds max dimension while preserving ratio
+            if img.width > max_dimension or img.height > max_dimension:
+                img.thumbnail((max_dimension, max_dimension))
 
-                buffer = io.BytesIO()
+            buffer = io.BytesIO()
 
-                # Convert images with transparency to RGB for JPEG encoding
-                if img.mode in ("RGBA", "LA") or (
-                    img.mode == "P" and "transparency" in img.info
-                ):
-                    img = img.convert("RGB")
+            # Convert images with transparency to RGB for JPEG encoding
+            if img.mode in ("RGBA", "LA") or (
+                img.mode == "P" and "transparency" in img.info
+            ):
+                img = img.convert("RGB")
 
-                img.save(buffer, format="JPEG")
-                mime_type = "image/jpeg"
+            img.save(buffer, format="JPEG")
+            mime_type = "image/jpeg"
 
-                # Encode image bytes to base64 data URL format
-                encoded_string = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                return f"data:{mime_type};base64,{encoded_string}"
+            # Encode image bytes to base64 data URL format
+            encoded_string = base64.b64encode(buffer.getvalue()).decode("utf-8")
+            return f"data:{mime_type};base64,{encoded_string}"
         except Exception as e:
             logger.error(f"Failed to encode image {image_path} to base64: {e}")
             raise
