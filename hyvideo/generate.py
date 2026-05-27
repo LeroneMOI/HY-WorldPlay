@@ -28,9 +28,11 @@ import json
 import mimetypes
 import numpy as np
 import queue
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from urllib.parse import urlparse
 from scipy.spatial.transform import Rotation as R
 from PIL import Image, ImageDraw, ImageFont
@@ -41,6 +43,10 @@ from hyvideo.commons import auto_offload_model
 from hyvideo.commons.parallel_states import initialize_parallel_state, get_parallel_state
 from hyvideo.commons.infer_state import initialize_infer_state
 from hyvideo.generate_custom_trajectory import generate_camera_trajectory_local, CameraState
+
+MY_WORLDPLAY_ROOT = Path(__file__).resolve().parents[2]
+if str(MY_WORLDPLAY_ROOT) not in sys.path:
+    sys.path.insert(0, str(MY_WORLDPLAY_ROOT))
 
 parallel_dims = initialize_parallel_state(sp=int(os.environ.get("WORLD_SIZE", "1")))
 torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
@@ -440,6 +446,68 @@ def save_action_prompt_memory(memory, path, base_prompt):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
+def default_prompt_cache_path(output_path):
+    return os.path.join(output_path, "prompt_cache.json")
+
+
+def read_prompt_cache_prompt(cache_path, chunk_id):
+    try:
+        from worldagent.vlm_environment_prompt_agent import read_prompt_from_cache
+
+        return read_prompt_from_cache(Path(cache_path), chunk_id)
+    except Exception as exc:
+        print(f"Failed to read prompt cache for chunk {chunk_id}: {exc}")
+        return None
+
+
+def run_vlm_prompt_cache_task(args, video_path, action, source_chunk_id, used_prompt):
+    try:
+        from argparse import Namespace
+        from worldagent.vlm_environment_prompt_agent import run_agent_to_prompt_cache
+
+        cache_path = args.vlm_prompt_cache_path or default_prompt_cache_path(args.output_path or "./outputs")
+        log_json = os.path.join(os.path.dirname(cache_path), "vlm_prompt_outputs.json")
+        vlm_args = Namespace(
+            video=video_path,
+            action=action,
+            previous_prompt=used_prompt,
+            user_goal=args.prompt,
+            base_url=args.vlm_base_url,
+            model=args.vlm_model,
+            api_key=args.vlm_api_key,
+            max_frames=args.vlm_max_frames,
+            max_image_size=args.vlm_max_image_size,
+            temperature=args.vlm_temperature,
+            max_tokens=args.vlm_max_tokens,
+            timeout=args.vlm_timeout,
+            frame_dir=args.vlm_frame_dir,
+            log_json=log_json,
+            log_jsonl=None,
+            prompt_cache=cache_path,
+            target_chunk_offset=args.vlm_prompt_target_offset,
+            target_chunk_id=source_chunk_id + args.vlm_prompt_target_offset,
+            chunk_id=source_chunk_id,
+            cache_source="vlm_web",
+            chunks_dir=None,
+            max_chunks=None,
+        )
+        result = run_agent_to_prompt_cache(
+            vlm_args,
+            chunk_id=source_chunk_id,
+            target_chunk_id=source_chunk_id + args.vlm_prompt_target_offset,
+        )
+        print(
+            "VLM prompt cache updated: "
+            f"chunk {source_chunk_id} -> {source_chunk_id + args.vlm_prompt_target_offset}"
+        )
+        return result
+    except Exception as exc:
+        print(f"VLM prompt cache task failed for chunk {source_chunk_id}: {exc}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
 WEB_INDEX_HTML = r"""<!doctype html>
 <html lang="en">
 <head>
@@ -601,6 +669,7 @@ WEB_INDEX_HTML = r"""<!doctype html>
       <div class="status">
         <div>Status: <strong id="state">loading</strong></div>
         <div>Last: <strong id="last">none</strong></div>
+        <div>Prompt cache: <strong id="cache">disabled</strong></div>
         <div>Total frames: <strong id="frames">0</strong></div>
       </div>
       <div class="prompt-box">
@@ -640,6 +709,7 @@ WEB_INDEX_HTML = r"""<!doctype html>
     };
     const stateEl = document.getElementById("state");
     const lastEl = document.getElementById("last");
+    const cacheEl = document.getElementById("cache");
     const framesEl = document.getElementById("frames");
     const video = document.getElementById("video");
     const timeline = document.getElementById("timeline");
@@ -707,7 +777,11 @@ WEB_INDEX_HTML = r"""<!doctype html>
       }
       stateEl.textContent = status.busy ? "rendering" : status.message;
       lastEl.textContent = status.last_command || "none";
+      cacheEl.textContent = status.prompt_cache_status || "disabled";
       framesEl.textContent = status.total_frames;
+      if (status.cached_next_prompt && document.activeElement !== promptInput) {
+        promptInput.value = status.cached_next_prompt;
+      }
       setButtons(status.busy || status.queue_size > 0);
       if (status.chunks.length !== chunks.length) {
         chunks = status.chunks;
@@ -749,11 +823,16 @@ def start_web_controller(args, output_path, latent_num):
     command_queue = queue.Queue()
     chunks_dir = os.path.join(output_path, "web_chunks")
     os.makedirs(chunks_dir, exist_ok=True)
+    prompt_cache_path = args.vlm_prompt_cache_path or default_prompt_cache_path(output_path)
     state = {
         "busy": False,
         "message": "ready",
         "last_command": None,
         "last_prompt": None,
+        "last_prompt_source": "manual",
+        "prompt_cache_enabled": bool(args.vlm_prompt_cache),
+        "prompt_cache_path": prompt_cache_path,
+        "prompt_cache_status": "disabled" if not args.vlm_prompt_cache else "ready",
         "total_frames": 0,
         "chunks": [],
         "base_prompt": args.prompt,
@@ -787,10 +866,16 @@ def start_web_controller(args, output_path, latent_num):
 
     def make_status():
         with lock:
+            next_chunk_id = len(state["chunks"]) + 1
+            cached_next_prompt = None
+            if args.vlm_prompt_cache:
+                cached_next_prompt = read_prompt_cache_prompt(prompt_cache_path, next_chunk_id)
             return {
                 **state,
                 "queue_size": command_queue.qsize(),
                 "chunk_latents": latent_num,
+                "next_chunk_id": next_chunk_id,
+                "cached_next_prompt": cached_next_prompt,
             }
 
     class WebHandler(BaseHTTPRequestHandler):
@@ -843,13 +928,30 @@ def start_web_controller(args, output_path, latent_num):
                             json_response(self, {"error": "unknown action"}, status=400)
                             return
                         command = f"{action}-{latent_num}"
-                    prompt = str(payload.get("prompt") or args.prompt).strip()
+                    next_chunk_id = 1
+                    with lock:
+                        next_chunk_id = len(state["chunks"]) + 1
+                    prompt_source = "manual"
+                    prompt = None
+                    if args.vlm_prompt_cache:
+                        prompt = read_prompt_cache_prompt(prompt_cache_path, next_chunk_id)
+                        if prompt:
+                            prompt_source = "prompt_cache"
+                    if not prompt:
+                        prompt = str(payload.get("prompt") or args.prompt).strip()
                     command_queue.put(
-                        {"type": "action", "command": command, "prompt": prompt}
+                        {
+                            "type": "action",
+                            "command": command,
+                            "prompt": prompt,
+                            "prompt_source": prompt_source,
+                            "target_chunk_id": next_chunk_id,
+                        }
                     )
                     with lock:
                         state["message"] = "queued"
                         state["last_prompt"] = prompt
+                        state["last_prompt_source"] = prompt_source
                     json_response(self, {"ok": True, "command": command})
                     return
                 if parsed.path == "/api/save":
@@ -887,6 +989,10 @@ def start_web_controller(args, output_path, latent_num):
             state["busy"] = False
             state["message"] = message
 
+    def mark_prompt_cache(status):
+        with lock:
+            state["prompt_cache_status"] = status
+
     def add_chunk(round_count, command, prompt, frames):
         filename = f"chunk_{round_count:04d}.mp4"
         path = os.path.join(chunks_dir, filename)
@@ -905,13 +1011,16 @@ def start_web_controller(args, output_path, latent_num):
             state["total_frames"] += int(frames.shape[2])
             state["busy"] = False
             state["message"] = "ready"
+        return path
 
     return {
         "queue": command_queue,
         "server": server,
         "mark_busy": mark_busy,
         "mark_ready": mark_ready,
+        "mark_prompt_cache": mark_prompt_cache,
         "add_chunk": add_chunk,
+        "prompt_cache_path": prompt_cache_path,
     }
 
 
@@ -1595,6 +1704,7 @@ def generate_video_interactive(args):
             pose_input = str(command_item.get("command", "")).strip()
             command_type = command_item.get("type", "action")
             chunk_prompt = str(command_item.get("prompt") or args.prompt).strip()
+            prompt_source = str(command_item.get("prompt_source") or "manual")
             if not chunk_prompt:
                 chunk_prompt = args.prompt
 
@@ -1725,7 +1835,26 @@ def generate_video_interactive(args):
 
             accumulated_frames.append(frames)
             if web_controller is not None and is_rank0:
-                web_controller["add_chunk"](round_count + 1, pose_input, chunk_prompt, frames)
+                chunk_id = round_count + 1
+                chunk_path = web_controller["add_chunk"](chunk_id, pose_input, chunk_prompt, frames)
+                if args.vlm_prompt_cache:
+                    web_controller["mark_prompt_cache"](f"analyzing chunk {chunk_id}")
+
+                    def _vlm_task():
+                        result = run_vlm_prompt_cache_task(
+                            args=args,
+                            video_path=chunk_path,
+                            action=pose_input,
+                            source_chunk_id=chunk_id,
+                            used_prompt=chunk_prompt,
+                        )
+                        if result is None:
+                            web_controller["mark_prompt_cache"](f"failed chunk {chunk_id}")
+                        else:
+                            target = chunk_id + args.vlm_prompt_target_offset
+                            web_controller["mark_prompt_cache"](f"ready prompt {target}")
+
+                    threading.Thread(target=_vlm_task, daemon=True).start()
 
             if display is not None:
                 for i in range(frames.shape[2]):
@@ -1738,6 +1867,7 @@ def generate_video_interactive(args):
                     "round": round_count,
                     "command": pose_input,
                     "prompt": chunk_prompt,
+                    "prompt_source": prompt_source,
                     "frames": int(frames.shape[2]),
                     "latent_frames": int(out.latents.shape[2]) if out.latents is not None else None,
                     "seed": args.seed + (round_count - 1) if args.seed else None,
@@ -2050,6 +2180,83 @@ def main():
         type=int,
         default=7860,
         help="Port for the interactive web UI (default: 7860).",
+    )
+    parser.add_argument(
+        "--vlm_prompt_cache",
+        type=str_to_bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Enable VLM prompt cache in interactive web mode.",
+    )
+    parser.add_argument(
+        "--vlm_prompt_cache_path",
+        type=str,
+        default=None,
+        help="Path to prompt_cache.json. Defaults to <output_path>/prompt_cache.json.",
+    )
+    parser.add_argument(
+        "--vlm_prompt_target_offset",
+        type=int,
+        default=1,
+        help="Target chunk offset for VLM prompt cache. 1 means chunk n writes prompt n+1.",
+    )
+    parser.add_argument(
+        "--vlm_base_url",
+        type=str,
+        default=os.getenv("VLM_BASE_URL", "http://localhost:8000/v1"),
+        help="OpenAI-compatible VLM base URL.",
+    )
+    parser.add_argument(
+        "--vlm_model",
+        type=str,
+        default=os.getenv(
+            "VLM_MODEL",
+            "/data3/dulingyi/worldmodel/models/Qwen3.5-9B/Qwen/Qwen3.5-9B",
+        ),
+        help="VLM model name/path served by vLLM.",
+    )
+    parser.add_argument(
+        "--vlm_api_key",
+        type=str,
+        default=os.getenv("VLM_API_KEY", "None"),
+        help="VLM API key for OpenAI-compatible endpoint.",
+    )
+    parser.add_argument(
+        "--vlm_max_frames",
+        type=int,
+        default=12,
+        help="Max frames sampled from each generated chunk for VLM.",
+    )
+    parser.add_argument(
+        "--vlm_max_image_size",
+        type=int,
+        default=1024,
+        help="Max image dimension sent to VLM.",
+    )
+    parser.add_argument(
+        "--vlm_temperature",
+        type=float,
+        default=0.1,
+        help="VLM sampling temperature.",
+    )
+    parser.add_argument(
+        "--vlm_max_tokens",
+        type=int,
+        default=1024,
+        help="VLM max output tokens.",
+    )
+    parser.add_argument(
+        "--vlm_timeout",
+        type=int,
+        default=600,
+        help="VLM request timeout in seconds.",
+    )
+    parser.add_argument(
+        "--vlm_frame_dir",
+        type=str,
+        default="/tmp/worldagent_vlm_frames",
+        help="Temporary directory for VLM frame extraction.",
     )
 
     args = parser.parse_args()

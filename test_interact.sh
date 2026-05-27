@@ -1,7 +1,7 @@
 export PYTHONPATH=$(cd "$(dirname "$0")" && pwd):$PYTHONPATH
 
 # export CUDA_VISIBLE_DEVICES=0,1,2,3
-export CUDA_VISIBLE_DEVICES=2,5,6,7
+export CUDA_VISIBLE_DEVICES=2,5
 
 # 设置 vLLM 服务地址（在本机运行）
 export T2V_REWRITE_BASE_URL="http://localhost:8000/v1"
@@ -37,7 +37,7 @@ HEIGHT=480
 
 # Configuration for faster inference
 # The maximum number recommended is 8.
-N_INFERENCE_GPU=4 # Parallel inference GPU count.
+N_INFERENCE_GPU=2 # Parallel inference GPU count.
 
 # Configuration for better quality
 REWRITE=true   # Enable prompt rewriting. Please ensure rewrite vLLM server is deployed and configured.
@@ -58,9 +58,10 @@ INTERACTIVE_VIDEO_LENGTH=13  # (4 latents - 1) * 4 + 1 = 13 frames per round
 INITIAL_POSE='w-4'           # Initial pose to move camera forward before first round
 WEB_PORT=7860
 
+# inference with autoregressive model (interactive mode)
 torchrun --nproc_per_node=$N_INFERENCE_GPU hyvideo/generate.py  \
   --prompt "$PROMPT" \
-  --image_path $IMAGE_PATH \
+  --image_path "$IMAGE_PATH" \
   --resolution $RESOLUTION \
   --aspect_ratio $ASPECT_RATIO \
   --seed $SEED \
@@ -68,9 +69,8 @@ torchrun --nproc_per_node=$N_INFERENCE_GPU hyvideo/generate.py  \
   --sr false \
   --output_path $OUTPUT_PATH \
   --model_path $MODEL_PATH \
-  --action_ckpt $AR_DISTILL_ACTION_MODEL_PATH \
-  --few_step true \
-  --num_inference_steps 4 \
+  --action_ckpt $AR_ACTION_MODEL_PATH \
+  --few_step false \
   --width $WIDTH \
   --height $HEIGHT \
   --model_type 'ar' \
@@ -81,11 +81,43 @@ torchrun --nproc_per_node=$N_INFERENCE_GPU hyvideo/generate.py  \
   --web true \
   --web_host 0.0.0.0 \
   --web_port $WEB_PORT \
+  --vlm_prompt_cache true \
+  --vlm_prompt_target_offset 1 \
   --use_vae_parallel false \
   --use_sageattn false \
   --use_fp8_gemm false \
   --transformer_resident_ar_rollout true \
   2>&1 | tee "$LOG_PATH"
+
+# inference with autoregressive distilled model (interactive mode)
+# torchrun --nproc_per_node=$N_INFERENCE_GPU hyvideo/generate.py  \
+#   --prompt "$PROMPT" \
+#   --image_path "$IMAGE_PATH" \
+#   --resolution $RESOLUTION \
+#   --aspect_ratio $ASPECT_RATIO \
+#   --seed $SEED \
+#   --rewrite false \
+#   --sr false \
+#   --output_path $OUTPUT_PATH \
+#   --model_path $MODEL_PATH \
+#   --action_ckpt $AR_DISTILL_ACTION_MODEL_PATH \
+#   --few_step true \
+#   --num_inference_steps 4 \
+#   --width $WIDTH \
+#   --height $HEIGHT \
+#   --model_type 'ar' \
+#   --interactive true \
+#   --interactive_video_length $INTERACTIVE_VIDEO_LENGTH \
+#   --initial_pose "$INITIAL_POSE" \
+#   --display_window false \
+#   --web true \
+#   --web_host 0.0.0.0 \
+#   --web_port $WEB_PORT \
+#   --use_vae_parallel false \
+#   --use_sageattn false \
+#   --use_fp8_gemm false \
+#   --transformer_resident_ar_rollout true \
+#   2>&1 | tee "$LOG_PATH"
 
 # ============================================================
 # Original batch mode (commented out)
