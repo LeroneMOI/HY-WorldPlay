@@ -1024,6 +1024,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         history_Ks=None,
         history_action=None,
         start_latent_idx=0,
+        prompt_condition_schedule=None,
     ):
         # When transformer_resident is True, keep the transformer on GPU for the
         # entire AR rollout instead of loading/offloading it per chunk.  This does
@@ -1046,6 +1047,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                         history_Ks=history_Ks,
                         history_action=history_action,
                         start_latent_idx=start_latent_idx,
+                        prompt_condition_schedule=prompt_condition_schedule,
                     )
                 finally:
                     self.enable_offloading = orig
@@ -1060,6 +1062,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 history_Ks=history_Ks,
                 history_action=history_action,
                 start_latent_idx=start_latent_idx,
+                prompt_condition_schedule=prompt_condition_schedule,
             )
 
     def _ar_rollout_inner(
@@ -1082,62 +1085,98 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
         history_Ks=None,
         history_action=None,
         start_latent_idx=0,
+        prompt_condition_schedule=None,
     ):
-        self.init_kv_cache()
         positive_idx = 1 if self.do_classifier_free_guidance else 0
         stabilization_level = 15
-        # text, siglip, byt5 embedding cache
-        with (
-            torch.autocast(
-                device_type="cuda",
-                dtype=self.target_dtype,
-                enabled=self.autocast_enabled,
-            ),
-            auto_offload_model(
-                self.transformer, self.execution_device, enabled=self.enable_offloading
-            ),
-        ):
-            extra_kwargs_pos = {
-                "byt5_text_states": extra_kwargs["byt5_text_states"][
-                    positive_idx, None, ...
-                ],
-                "byt5_text_mask": extra_kwargs["byt5_text_mask"][
-                    positive_idx, None, ...
-                ],
-            }
-            t_expand_txt = torch.tensor([0]).to(device).to(latents.dtype)
-            self._kv_cache = self.transformer(
-                bi_inference=False,
-                ar_txt_inference=True,
-                ar_vision_inference=False,
-                timestep_txt=t_expand_txt,
-                text_states=prompt_embeds[positive_idx, None, ...],
-                encoder_attention_mask=prompt_mask[positive_idx, None, ...],
-                vision_states=vision_states[positive_idx, None, ...],
-                mask_type=task_type,
-                extra_kwargs=extra_kwargs_pos,
-                kv_cache=self._kv_cache,
-                cache_txt=True,
-            )
-            if self.do_classifier_free_guidance:
-                extra_kwargs_neg = {
-                    "byt5_text_states": extra_kwargs["byt5_text_states"][0, None, ...],
-                    "byt5_text_mask": extra_kwargs["byt5_text_mask"][0, None, ...],
+        base_prompt_condition = {
+            "prompt_embeds": prompt_embeds,
+            "prompt_mask": prompt_mask,
+            "extra_kwargs": extra_kwargs,
+        }
+
+        def cache_text_condition(condition):
+            self.init_kv_cache()
+            condition_prompt_embeds = condition["prompt_embeds"]
+            condition_prompt_mask = condition["prompt_mask"]
+            condition_extra_kwargs = condition["extra_kwargs"]
+            with (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=self.target_dtype,
+                    enabled=self.autocast_enabled,
+                ),
+                auto_offload_model(
+                    self.transformer,
+                    self.execution_device,
+                    enabled=self.enable_offloading,
+                ),
+            ):
+                extra_kwargs_pos = {
+                    "byt5_text_states": condition_extra_kwargs["byt5_text_states"][
+                        positive_idx, None, ...
+                    ],
+                    "byt5_text_mask": condition_extra_kwargs["byt5_text_mask"][
+                        positive_idx, None, ...
+                    ],
                 }
                 t_expand_txt = torch.tensor([0]).to(device).to(latents.dtype)
-                self._kv_cache_neg = self.transformer(
+                self._kv_cache = self.transformer(
                     bi_inference=False,
                     ar_txt_inference=True,
                     ar_vision_inference=False,
                     timestep_txt=t_expand_txt,
-                    text_states=prompt_embeds[0, None, ...],
-                    encoder_attention_mask=prompt_mask[0, None, ...],
-                    vision_states=vision_states[0, None, ...],
+                    text_states=condition_prompt_embeds[positive_idx, None, ...],
+                    encoder_attention_mask=condition_prompt_mask[positive_idx, None, ...],
+                    vision_states=vision_states[positive_idx, None, ...],
                     mask_type=task_type,
-                    extra_kwargs=extra_kwargs_neg,
-                    kv_cache=self._kv_cache_neg,
+                    extra_kwargs=extra_kwargs_pos,
+                    kv_cache=self._kv_cache,
                     cache_txt=True,
                 )
+                if self.do_classifier_free_guidance:
+                    extra_kwargs_neg = {
+                        "byt5_text_states": condition_extra_kwargs["byt5_text_states"][
+                            0, None, ...
+                        ],
+                        "byt5_text_mask": condition_extra_kwargs["byt5_text_mask"][
+                            0, None, ...
+                        ],
+                    }
+                    t_expand_txt = torch.tensor([0]).to(device).to(latents.dtype)
+                    self._kv_cache_neg = self.transformer(
+                        bi_inference=False,
+                        ar_txt_inference=True,
+                        ar_vision_inference=False,
+                        timestep_txt=t_expand_txt,
+                        text_states=condition_prompt_embeds[0, None, ...],
+                        encoder_attention_mask=condition_prompt_mask[0, None, ...],
+                        vision_states=vision_states[0, None, ...],
+                        mask_type=task_type,
+                        extra_kwargs=extra_kwargs_neg,
+                        kv_cache=self._kv_cache_neg,
+                        cache_txt=True,
+                    )
+
+        prompt_condition_schedule = sorted(
+            prompt_condition_schedule or [],
+            key=lambda item: item["start_chunk"],
+        )
+        active_prompt_condition_idx = None
+
+        def select_prompt_condition(chunk_i):
+            selected_idx = None
+            for idx, item in enumerate(prompt_condition_schedule):
+                if item["start_chunk"] <= chunk_i:
+                    selected_idx = idx
+                else:
+                    break
+            if selected_idx is None:
+                return None, base_prompt_condition
+            return selected_idx, prompt_condition_schedule[selected_idx]
+
+        # text, siglip, byt5 embedding cache
+        cache_text_condition(base_prompt_condition)
 
         history_latent_frames = (
             history_latents.shape[2] if history_latents is not None else 0
@@ -1161,6 +1200,10 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             )  # the current frame index to generate
             global_frame_idx = start_latent_idx + current_frame_idx
             selected_context_count = 0
+            prompt_condition_idx, prompt_condition = select_prompt_condition(chunk_i)
+            if prompt_condition_idx != active_prompt_condition_idx:
+                cache_text_condition(prompt_condition)
+                active_prompt_condition_idx = prompt_condition_idx
 
             if chunk_i > 0 or has_history:
 
@@ -1882,6 +1925,71 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             if prompt_mask_2 is not None:
                 prompt_mask_2 = torch.cat([negative_prompt_mask_2, prompt_mask_2])
 
+        prompt_condition_schedule = None
+        raw_prompt_schedule = kwargs.get("prompt_schedule")
+        if raw_prompt_schedule:
+            prompt_condition_schedule = []
+            for item in raw_prompt_schedule:
+                schedule_prompt = item["prompt"]
+                with auto_offload_model(
+                    self.text_encoder,
+                    self.execution_device,
+                    enabled=self.enable_offloading,
+                ):
+                    (
+                        schedule_prompt_embeds,
+                        schedule_negative_prompt_embeds,
+                        schedule_prompt_mask,
+                        schedule_negative_prompt_mask,
+                    ) = self.encode_prompt(
+                        schedule_prompt,
+                        device,
+                        num_videos_per_prompt,
+                        self.do_classifier_free_guidance,
+                        negative_prompt,
+                        clip_skip=self.clip_skip,
+                        data_type="video",
+                    )
+
+                schedule_extra_kwargs = {}
+                if self.config.glyph_byT5_v2:
+                    with auto_offload_model(
+                        self.byt5_model,
+                        self.execution_device,
+                        enabled=self.enable_offloading,
+                    ):
+                        schedule_extra_kwargs = self._prepare_byt5_embeddings(
+                            schedule_prompt, device
+                        )
+
+                if self.do_classifier_free_guidance:
+                    schedule_prompt_embeds = torch.cat(
+                        [schedule_negative_prompt_embeds, schedule_prompt_embeds]
+                    )
+                    if schedule_prompt_mask is not None:
+                        schedule_prompt_mask = torch.cat(
+                            [schedule_negative_prompt_mask, schedule_prompt_mask]
+                        )
+
+                prompt_condition_schedule.append(
+                    {
+                        "start_chunk": int(
+                            item.get(
+                                "start_chunk",
+                                (
+                                    int(item.get("start_latent", 0))
+                                    + chunk_latent_frames
+                                    - 1
+                                )
+                                // chunk_latent_frames,
+                            )
+                        ),
+                        "prompt_embeds": schedule_prompt_embeds,
+                        "prompt_mask": schedule_prompt_mask,
+                        "extra_kwargs": schedule_extra_kwargs,
+                    }
+                )
+
         extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.set_timesteps, {"n_tokens": n_tokens}
         )
@@ -1959,6 +2067,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                 history_Ks=history_Ks,
                 history_action=history_action,
                 start_latent_idx=start_latent_idx,
+                prompt_condition_schedule=prompt_condition_schedule,
             )
         elif model_type == "bi":
             latents = self.bi_rollout(

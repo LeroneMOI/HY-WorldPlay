@@ -1,7 +1,7 @@
 export PYTHONPATH=$(cd "$(dirname "$0")" && pwd):$PYTHONPATH
 
 # export CUDA_VISIBLE_DEVICES=0,1,2,3
-export CUDA_VISIBLE_DEVICES=2,5,6,7
+export CUDA_VISIBLE_DEVICES=0
 
 # 设置 vLLM 服务地址（在本机运行）
 export T2V_REWRITE_BASE_URL="http://localhost:8000/v1"
@@ -29,12 +29,13 @@ AR_DISTILL_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/ar_distilled_action_model/dif
 POSE='w-46,left-41'                   # Camera trajectory: pose string (e.g., 'w-31' means generating [1 + 31] latents) or JSON file path
 # POSE='w-55'
 NUM_FRAMES=349
+PROMPT_SCHEDULE_JSON=/data3/dulingyi/worldmodel/my_worldplay/test_image/prompt_schedule_change_prompt.json
 WIDTH=832
 HEIGHT=480
 
 # Configuration for faster inference
 # The maximum number recommended is 8.
-N_INFERENCE_GPU=4 # Parallel inference GPU count.
+N_INFERENCE_GPU=1 # Parallel inference GPU count.
 
 # Configuration for better quality
 REWRITE=false   # Enable prompt rewriting. Please ensure rewrite vLLM server is deployed and configured.
@@ -42,39 +43,49 @@ ENABLE_SR=false # Enable super resolution. When the NUM_FRAMES == 125, you can s
 
 # Multiple input images. Add or remove paths here as needed.
 IMAGE_PATHS=(
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_1.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_2.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_3.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_4.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_5.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_6.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_7.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_8.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_9.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_10.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img1.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img2.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img3.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img4.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img5.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_1.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_2.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_3.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_4.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_5.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_6.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_7.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_8.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_9.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_10.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img1.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img2.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img3.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img4.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img5.png
   /data3/dulingyi/worldmodel/my_worldplay/test_image/img6.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img7.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img8.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img9.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img10.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img11.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img12.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img13.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img14.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img15.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img16.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img17.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img18.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/img19.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img7.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img8.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img9.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img10.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img11.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img12.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img13.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img14.png
+  # # /data3/dulingyi/worldmodel/my_worldplay/test_image/img15.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img16.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img17.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img18.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img19.png
 )
 
 set -o pipefail
 FAILED_IMAGES=()
+
+if [[ ! -f "$PROMPT_SCHEDULE_JSON" ]]; then
+  echo "[ERROR] Missing prompt schedule JSON: $PROMPT_SCHEDULE_JSON"
+  exit 1
+fi
+
+if ! [[ "$N_INFERENCE_GPU" =~ ^[0-9]+$ ]] || (( N_INFERENCE_GPU < 1 )); then
+  echo "[ERROR] N_INFERENCE_GPU must be a positive integer, got: '$N_INFERENCE_GPU'"
+  exit 1
+fi
 
 # inference with bidirectional model
 # torchrun --nproc_per_node=$N_INFERENCE_GPU hyvideo/generate.py  \
@@ -111,7 +122,7 @@ for IMAGE_PATH in "${IMAGE_PATHS[@]}"; do
   echo "[INFO] Start inference: $IMAGE_PATH"
   echo "[INFO] Output path: $OUTPUT_PATH"
 
-  python - "$METADATA_PATH" "$IMAGE_PATH" "$OUTPUT_PATH" "$LOG_PATH" "$PROMPT" "$POSE" "$MODEL_PATH" "$AR_ACTION_MODEL_PATH" "$BI_ACTION_MODEL_PATH" "$AR_DISTILL_ACTION_MODEL_PATH" "$SEED" "$ASPECT_RATIO" "$RESOLUTION" "$NUM_FRAMES" "$WIDTH" "$HEIGHT" "$N_INFERENCE_GPU" "$REWRITE" "$ENABLE_SR" <<'PY'
+  python - "$METADATA_PATH" "$IMAGE_PATH" "$OUTPUT_PATH" "$LOG_PATH" "$PROMPT" "$POSE" "$PROMPT_SCHEDULE_JSON" "$MODEL_PATH" "$AR_ACTION_MODEL_PATH" "$BI_ACTION_MODEL_PATH" "$AR_DISTILL_ACTION_MODEL_PATH" "$SEED" "$ASPECT_RATIO" "$RESOLUTION" "$NUM_FRAMES" "$WIDTH" "$HEIGHT" "$N_INFERENCE_GPU" "$REWRITE" "$ENABLE_SR" <<'PY'
 import json
 import os
 import sys
@@ -124,6 +135,7 @@ import time
     log_path,
     prompt,
     pose,
+    prompt_schedule_json,
     model_path,
     ar_action_model_path,
     bi_action_model_path,
@@ -150,6 +162,7 @@ data = {
         "metadata_json": metadata_path,
     },
     "prompt": prompt,
+    "prompt_schedule_json": os.path.abspath(prompt_schedule_json),
     "actions": [item for item in pose.split(",") if item],
     "model": {
         "model_path": os.path.abspath(model_path),
@@ -163,6 +176,7 @@ data = {
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
         "pose": pose,
+        "prompt_schedule_json": os.path.abspath(prompt_schedule_json),
         "num_frames": int(num_frames),
         "width": int(width),
         "height": int(height),
@@ -183,7 +197,7 @@ with open(metadata_path, "w", encoding="utf-8") as f:
 PY
 
   # inference with autoregressive model
-  torchrun --master_port=29511 --nproc_per_node=$N_INFERENCE_GPU hyvideo/generate.py  \
+  torchrun --master_port=29512 --nproc_per_node=$N_INFERENCE_GPU hyvideo/generate.py  \
     --prompt "$PROMPT" \
     --image_path "$IMAGE_PATH" \
     --resolution $RESOLUTION \
@@ -193,6 +207,7 @@ PY
     --rewrite $REWRITE \
     --sr $ENABLE_SR --save_pre_sr_video \
     --pose "$POSE" \
+    --prompt_schedule_json "$PROMPT_SCHEDULE_JSON" \
     --with-ui true \
     --output_path "$OUTPUT_PATH" \
     --model_path $MODEL_PATH \

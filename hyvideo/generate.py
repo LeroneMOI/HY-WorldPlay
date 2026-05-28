@@ -239,7 +239,8 @@ def incremental_poses_to_input(incremental_poses, prev_c2w=None, intrinsic=None)
     rotate_one_hot = np.zeros((relative_c2w.shape[0], 4), dtype=np.int32)
 
     move_norm_valid = 0.0001
-    for i in range(1, relative_c2w.shape[0]):
+    action_start_idx = 0 if prev_c2w is not None else 1
+    for i in range(action_start_idx, relative_c2w.shape[0]):
         move_dirs = relative_c2w[i, :3, 3]
         move_norms = np.linalg.norm(move_dirs)
         if move_norms > move_norm_valid:
@@ -395,6 +396,61 @@ def pose_to_input(pose_data, latent_num, tps=False):
     action_one_label = trans_one_label * 9 + rotate_one_label
 
     return torch.as_tensor(w2c_list), torch.as_tensor(intrinsic_list), action_one_label
+
+
+def load_prompt_schedule_json(schedule_path, fallback_prompt):
+    """
+    Load a non-interactive prompt schedule.
+
+    Supported JSON format:
+    {
+      "segments": [
+        {"pose": "w-46", "prompt": "first prompt"},
+        {"pose": "left-41", "prompt": "second prompt"}
+      ]
+    }
+
+    Pose durations are latent steps, matching the existing pose string syntax.
+    Prompt changes are applied at AR chunk boundaries.
+    """
+    with open(schedule_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    segments = data.get("segments", data) if isinstance(data, dict) else data
+    if not isinstance(segments, list) or not segments:
+        raise ValueError(
+            f"Invalid prompt schedule JSON: {schedule_path}. "
+            "Expected a non-empty list or an object with a non-empty 'segments' list."
+        )
+
+    pose_parts = []
+    prompt_schedule = []
+    cumulative_motion_latents = 0
+    current_prompt = fallback_prompt
+
+    for idx, segment in enumerate(segments):
+        if not isinstance(segment, dict):
+            raise ValueError(f"Invalid segment #{idx}: expected an object.")
+        pose = str(segment.get("pose", "")).strip()
+        if not pose:
+            raise ValueError(f"Invalid segment #{idx}: missing non-empty 'pose'.")
+
+        prompt = segment.get("prompt", current_prompt)
+        if prompt is None:
+            prompt = current_prompt
+        prompt = str(prompt)
+
+        start_latent = cumulative_motion_latents if idx == 0 else cumulative_motion_latents + 1
+        prompt_schedule.append({"start_latent": int(start_latent), "prompt": prompt})
+
+        pose_parts.append(pose)
+        cumulative_motion_latents += len(parse_pose_string(pose))
+        current_prompt = prompt
+
+    pose = ",".join(pose_parts)
+    latent_num = cumulative_motion_latents + 1
+    video_length = latent_num * 4 - 3
+    return pose, video_length, prompt_schedule
 
 
 def save_video(video, path):
@@ -864,6 +920,11 @@ def start_web_controller(args, output_path, latent_num):
         raw = handler.rfile.read(content_length)
         return json.loads(raw.decode("utf-8"))
 
+    def command_duration_for_next_chunk(next_chunk_id):
+        if next_chunk_id == 1 and not args.initial_pose:
+            return latent_num - 1
+        return latent_num
+
     def make_status():
         with lock:
             next_chunk_id = len(state["chunks"]) + 1
@@ -874,6 +935,7 @@ def start_web_controller(args, output_path, latent_num):
                 **state,
                 "queue_size": command_queue.qsize(),
                 "chunk_latents": latent_num,
+                "next_command_duration": command_duration_for_next_chunk(next_chunk_id),
                 "next_chunk_id": next_chunk_id,
                 "cached_next_prompt": cached_next_prompt,
             }
@@ -927,10 +989,11 @@ def start_web_controller(args, output_path, latent_num):
                         if not action:
                             json_response(self, {"error": "unknown action"}, status=400)
                             return
-                        command = f"{action}-{latent_num}"
                     next_chunk_id = 1
                     with lock:
                         next_chunk_id = len(state["chunks"]) + 1
+                    if not command:
+                        command = f"{action}-{command_duration_for_next_chunk(next_chunk_id)}"
                     prompt_source = "manual"
                     prompt = None
                     if args.vlm_prompt_cache:
@@ -1430,6 +1493,22 @@ def add_keyboard_overlay_to_video(video_path, output_path, actions_timeline):
 
 
 def generate_video(args):
+    prompt_schedule = None
+    if args.prompt_schedule_json:
+        scheduled_pose, scheduled_video_length, prompt_schedule = load_prompt_schedule_json(
+            args.prompt_schedule_json, args.prompt
+        )
+        args.pose = scheduled_pose
+        args.video_length = scheduled_video_length
+        if prompt_schedule:
+            args.prompt = prompt_schedule[0]["prompt"]
+        rank0_log(
+            f"Loaded prompt schedule from {args.prompt_schedule_json}: "
+            f"pose='{args.pose}', video_length={args.video_length}, "
+            f"prompt_changes={len(prompt_schedule)}",
+            "INFO",
+        )
+
     assert (
         (args.video_length - 1) // 4 + 1
     ) % 4 == 0, "number of latents must be divisible by 4"
@@ -1498,6 +1577,7 @@ def generate_video(args):
         user_height=args.height,
         user_width=args.width,
         transformer_resident_ar_rollout=args.transformer_resident_ar_rollout,
+        prompt_schedule=prompt_schedule,
         **extra_kwargs,
     )
 
@@ -1613,6 +1693,12 @@ def generate_video_interactive(args):
     camera_state = CameraState()
 
     if args.initial_pose:
+        rank0_log(
+            "initial_pose advances the camera before any latent history exists. "
+            "For i2v interactive generation this can mismatch the reference image "
+            "condition with the first generated camera pose.",
+            "WARNING",
+        )
         initial_motions = parse_pose_string(args.initial_pose)
         generate_camera_trajectory_local(initial_motions, camera_state)
 
@@ -1647,7 +1733,11 @@ def generate_video_interactive(args):
     if args.web:
         print(f"Interactive Web Mode - open http://{args.web_host}:{args.web_port}")
     else:
-        print("Interactive Mode - Enter pose commands (e.g., 'w-4,d-2')")
+        first_duration = latent_num if args.initial_pose else latent_num - 1
+        print(
+            "Interactive Mode - Enter pose commands "
+            f"(first e.g. 'w-{first_duration}', then e.g. 'w-{latent_num}')"
+        )
     print("Commands: w(forward), s(backward), a(left), d(right)")
     print("          up, down (pitch), left, right (yaw)")
     print("Type 'quit' or 'q' to exit, 'save' to save video")
@@ -1750,10 +1840,12 @@ def generate_video_interactive(args):
                 print("No new poses to generate")
                 continue
             if len(incremental_poses) != latent_num:
+                expected_duration = latent_num if prev_c2w is not None else latent_num - 1
                 raise ValueError(
                     f"Interactive command produced {len(incremental_poses)} latent poses, "
                     f"but interactive_video_length={interactive_video_length} requires {latent_num}. "
-                    f"Use commands whose total duration is {latent_num}, e.g. 'w-{latent_num}'."
+                    f"Use commands whose total duration is {expected_duration}, "
+                    f"e.g. 'w-{expected_duration}'."
                 )
             camera_state = next_camera_state
 
@@ -1915,6 +2007,15 @@ def main():
     )
     parser.add_argument(
         "--prompt", type=str, required=True, help="Text prompt for video generation"
+    )
+    parser.add_argument(
+        "--prompt_schedule_json",
+        type=str,
+        default=None,
+        help=(
+            "Optional JSON file with non-interactive pose/prompt segments. "
+            "When set, it overrides --pose and --video_length."
+        ),
     )
     parser.add_argument(
         "--negative_prompt",
