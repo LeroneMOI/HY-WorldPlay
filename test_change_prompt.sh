@@ -20,7 +20,7 @@ SEED=1
 ASPECT_RATIO=16:9
 RESOLUTION=480p # Now we only provide the 480p model
 RUN_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_ROOT=../outputs/test
+OUTPUT_ROOT=../outputs/test/${RUN_TIMESTAMP}
 MODEL_PATH=../ckpts/HunyuanVideo-1.5                   # Path to pretrained hunyuanvideo-1.5 model
 # AR_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/ar_model/diffusion_pytorch_model.safetensors         # Path to our HY-World 1.5 autoregressive checkpoints
 AR_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/ar_rl_model/diffusion_pytorch_model.safetensors
@@ -29,7 +29,6 @@ AR_DISTILL_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/ar_distilled_action_model/dif
 POSE='w-46,left-41'                   # Camera trajectory: pose string (e.g., 'w-31' means generating [1 + 31] latents) or JSON file path
 # POSE='w-55'
 NUM_FRAMES=349
-PROMPT_SCHEDULE_JSON=/data3/dulingyi/worldmodel/my_worldplay/test_image/prompt_schedule_change_prompt.json
 WIDTH=832
 HEIGHT=480
 
@@ -43,42 +42,81 @@ ENABLE_SR=false # Enable super resolution. When the NUM_FRAMES == 125, you can s
 
 # Multiple input images. Add or remove paths here as needed.
 IMAGE_PATHS=(
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_1.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_2.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_3.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_4.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_5.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_6.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_7.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_8.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_9.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_10.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img1.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img2.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img3.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img4.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img5.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_1.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_2.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_3.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_4.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_5.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_6.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_7.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_8.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_9.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_10.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img1.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img2.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img3.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img4.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img5.png
   /data3/dulingyi/worldmodel/my_worldplay/test_image/img6.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img7.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img8.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img9.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img10.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img11.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img12.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img13.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img14.png
-  # # /data3/dulingyi/worldmodel/my_worldplay/test_image/img15.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img16.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img17.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img18.png
-  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img19.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img7.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img8.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img9.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img10.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img11.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img12.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img13.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img14.png
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img15.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img16.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img17.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img18.png
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img19.png
+)
+
+# Prompt schedule JSONs. Keep the order aligned with IMAGE_PATHS.
+PROMPT_SCHEDULE_JSONS=(
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_1.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_2.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_3.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_4.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_5.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_6.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_7.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_8.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_9.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/close_10.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img1.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img2.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img3.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img4.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img5.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img6.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img7.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img8.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img9.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img10.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img11.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img12.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img13.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img14.json
+  # /data3/dulingyi/worldmodel/my_worldplay/test_image/img15.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img16.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img17.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img18.json
+  /data3/dulingyi/worldmodel/my_worldplay/test_image/img19.json
 )
 
 set -o pipefail
 FAILED_IMAGES=()
 
-if [[ ! -f "$PROMPT_SCHEDULE_JSON" ]]; then
-  echo "[ERROR] Missing prompt schedule JSON: $PROMPT_SCHEDULE_JSON"
+if (( ${#IMAGE_PATHS[@]} == 0 )); then
+  echo "[ERROR] IMAGE_PATHS is empty"
+  exit 1
+fi
+
+if (( ${#IMAGE_PATHS[@]} != ${#PROMPT_SCHEDULE_JSONS[@]} )); then
+  echo "[ERROR] IMAGE_PATHS and PROMPT_SCHEDULE_JSONS must have the same length"
+  echo "[ERROR] IMAGE_PATHS: ${#IMAGE_PATHS[@]}, PROMPT_SCHEDULE_JSONS: ${#PROMPT_SCHEDULE_JSONS[@]}"
   exit 1
 fi
 
@@ -104,9 +142,19 @@ fi
 #   --few_step false \
 #   --model_type 'bi'
 
-for IMAGE_PATH in "${IMAGE_PATHS[@]}"; do
+for INDEX in "${!IMAGE_PATHS[@]}"; do
+  IMAGE_PATH="${IMAGE_PATHS[$INDEX]}"
+  PROMPT_SCHEDULE_JSON="${PROMPT_SCHEDULE_JSONS[$INDEX]}"
+
   if [[ ! -f "$IMAGE_PATH" ]]; then
     echo "[WARN] Skip missing image: $IMAGE_PATH"
+    FAILED_IMAGES+=("$IMAGE_PATH")
+    continue
+  fi
+
+  if [[ ! -f "$PROMPT_SCHEDULE_JSON" ]]; then
+    echo "[WARN] Skip missing prompt schedule JSON for image: $IMAGE_PATH"
+    echo "[WARN] Missing prompt schedule JSON: $PROMPT_SCHEDULE_JSON"
     FAILED_IMAGES+=("$IMAGE_PATH")
     continue
   fi
@@ -114,12 +162,13 @@ for IMAGE_PATH in "${IMAGE_PATHS[@]}"; do
   IMAGE_PATH_TAG="${IMAGE_PATH#./}"
   IMAGE_PATH_TAG="${IMAGE_PATH_TAG//\//-}"
   IMAGE_PATH_TAG="${IMAGE_PATH_TAG%.*}"
-  OUTPUT_PATH="${OUTPUT_ROOT}/test_${IMAGE_PATH_TAG}_${RUN_TIMESTAMP}"
+  OUTPUT_PATH="${OUTPUT_ROOT}/test_${IMAGE_PATH_TAG}"
   mkdir -p "$OUTPUT_PATH"
   LOG_PATH="$OUTPUT_PATH/terminal_$(date +%Y%m%d_%H%M%S).log"
   METADATA_PATH="$OUTPUT_PATH/run_metadata.json"
 
   echo "[INFO] Start inference: $IMAGE_PATH"
+  echo "[INFO] Prompt schedule: $PROMPT_SCHEDULE_JSON"
   echo "[INFO] Output path: $OUTPUT_PATH"
 
   python - "$METADATA_PATH" "$IMAGE_PATH" "$OUTPUT_PATH" "$LOG_PATH" "$PROMPT" "$POSE" "$PROMPT_SCHEDULE_JSON" "$MODEL_PATH" "$AR_ACTION_MODEL_PATH" "$BI_ACTION_MODEL_PATH" "$AR_DISTILL_ACTION_MODEL_PATH" "$SEED" "$ASPECT_RATIO" "$RESOLUTION" "$NUM_FRAMES" "$WIDTH" "$HEIGHT" "$N_INFERENCE_GPU" "$REWRITE" "$ENABLE_SR" <<'PY'

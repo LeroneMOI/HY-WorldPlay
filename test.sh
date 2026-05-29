@@ -20,15 +20,15 @@ SEED=1
 ASPECT_RATIO=16:9
 RESOLUTION=480p # Now we only provide the 480p model
 RUN_TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_ROOT=../outputs/test
+OUTPUT_ROOT=../outputs/test/$RUN_TIMESTAMP
 MODEL_PATH=../ckpts/HunyuanVideo-1.5                   # Path to pretrained hunyuanvideo-1.5 model
 # AR_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/ar_model/diffusion_pytorch_model.safetensors         # Path to our HY-World 1.5 autoregressive checkpoints
 AR_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/ar_rl_model/diffusion_pytorch_model.safetensors
 BI_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/bidirectional_model/diffusion_pytorch_model.safetensors         # Path to our HY-World 1.5 bidirectional checkpoints
 AR_DISTILL_ACTION_MODEL_PATH=../ckpts/HY-WorldPlay/ar_distilled_action_model/diffusion_pytorch_model.safetensors # Path to our HY-World 1.5 autoregressive distilled checkpoints
-POSE='w-46,left-41'                   # Camera trajectory: pose string (e.g., 'w-31' means generating [1 + 31] latents) or JSON file path
+POSE='w-69,left-90'                   # Camera trajectory: pose string (e.g., 'w-31' means generating [1 + 31] latents) or JSON file path
 # POSE='w-55'
-NUM_FRAMES=349
+NUM_FRAMES=637
 WIDTH=832
 HEIGHT=480
 
@@ -42,16 +42,16 @@ ENABLE_SR=false # Enable super resolution. When the NUM_FRAMES == 125, you can s
 
 # Multiple input images. Add or remove paths here as needed.
 IMAGE_PATHS=(
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_1.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_2.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_3.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_4.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_5.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_6.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_7.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_8.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_9.png
-  /data3/dulingyi/worldmodel/my_worldplay/test_image/close_10.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_1.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_2.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_3.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_4.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_5.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_6.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_7.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_8.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_9.png
+#   /data3/dulingyi/worldmodel/my_worldplay/test_image/close_10.png
   /data3/dulingyi/worldmodel/my_worldplay/test_image/img1.png
   /data3/dulingyi/worldmodel/my_worldplay/test_image/img2.png
   /data3/dulingyi/worldmodel/my_worldplay/test_image/img3.png
